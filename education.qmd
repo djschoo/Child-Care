@@ -1,0 +1,181 @@
+---
+title: "Budget Impact of a Wage Floor for Early Childhood Educators"
+format: html
+editor_options: 
+  chunk_output_type: console
+code-fold: true
+---
+
+```{r setup}
+#| include: false
+knitr::opts_chunk$set(echo = T, warning=F, message=F, results=F)
+```
+
+```{r clean up this data set}
+pacman::p_load(dplyr, tidyr, purrr, stringr, ggplot2)
+
+df_import = readxl::read_excel("C:/Fictious Child Care Worker Data.xlsx", sheet=2) %>%
+  rename(id = `Survey ID`) %>%
+  mutate(id = as.integer(id))
+
+# Q52 is presented in a wacky order so need to split it up before converting
+df_52_2 = df_import %>% select(matches("QID52_[0-9]+_2"))
+
+df = df_import %>% 
+  select(-names(df_52_2)) %>%
+  bind_cols(df_52_2)
+
+# this is a (hopefully) parsimonious way of converting all the wage columns into a tidy format
+df = map2(0:7, c("initials", "highest_ece", "received_we", "wage_we_before", "wage_no_we", "wage", "hours", "wage_we_after"), function(i, name) {
+  question = df %>%
+    select(id, (32 + i*20):(32 + i*20 + 19)) %>%
+    pivot_longer(cols=2:last_col(), names_to="emp_no", values_to=name) %>%
+    na.omit() %>% 
+    arrange(id, emp_no)
+  question$emp_no = map_int(question$emp_no, function(n) as.integer(str_extract_all(n, "[0-9]+")[[1]][2])) # str_extract_all apparently isn't vectorized?!
+  return(question)
+}) %>%
+  purrr::reduce(full_join)
+
+# The budget impact only concerns ECEs and not the other types
+ece = df %>% 
+  relocate(wage_we_after, .after="wage_no_we") %>%
+  filter(str_detect(highest_ece, ".*\\(ECE\\)$")) %>% 
+  select(-highest_ece) %>%
+  mutate(received_we = case_when(
+    is.na(received_we) ~ NA,
+    str_detect(received_we, "^Does not receive") ~ F,
+    T ~ T
+    ))
+```
+
+The purpose of this analysis is to present a simple model that estimates the budget impact associated with introducing a wage floor for Early Childhood Educators (ECEs). Currently, almost all ECEs receive a wage enhancement (WE) of \$4 per hour that is paid regardless of the wage before the wage enhancement. 
+
+This brief analysis presents two separate budget impact models. In the first model, all ECEs are bumped up to a minimum wage of $25/hour, regardless of whether they receive the wage enhancement. And in the second model, only those ECEs that do not receive the wage enhancement are given the wage enhancement, up to a maximum salary of \$4/hour.
+
+```{r}
+finding1 = ece %>%
+  group_by(received_we) %>%
+  summarise(n = n()) %>%
+  mutate(p = n / sum(n)) %>%
+  arrange(received_we)
+```
+
+According to the data set provided, there are `r ece %>% select(id, emp_no) %>% nrow()` ECEs that work in `r ece %>% select(id) %>% unique() %>% nrow()` distinct facilities. Of these ECEs, `r finding1[[1,2]]` (`r scales::percent(finding1[[1,3]]) `) do not receive the wage enhancement, and `r finding1[[2,2]]` (`r scales::percent(finding1[[2,3]])`) do. (There is no data for the remaining ECEs.)
+
+```{r quick look at some wage outliers}
+#| include: false
+
+# exclude all this because it's too large for 1-page doc
+ece %>%
+  pivot_longer(cols=starts_with("wage")) %>%
+  na.omit() %>%
+  select(value) %>%
+  rstatix::identify_outliers() %>%
+  unique() %>%
+  filter(is.extreme) %>%
+  pull(value) %>%
+  sort()
+
+ece %>%
+  select(wage_we_after, wage_we_before) %>%
+  setNames(c("Hourly Wage After the ECE WE", "Hourly Wage Before the ECE WE")) %>%
+  pivot_longer(cols=1:2) %>%
+  na.omit() %>%
+  filter(value <= 100) %>%
+  ggplot(aes(x=value)) +
+  geom_histogram() +
+  facet_wrap(~name) +
+  ggthemes::theme_clean() +
+  labs(x="wage ($/hour)") + 
+  scale_x_continuous(labels = scales::dollar_format())
+```
+
+There are likely some outliers in the wages data, presumably due to some values entered as weekly rather than hourly wages. Hence, for the following analysis, any wage entry over \$100 will be omitted. Note that these omissions will not affect the budgetary analysis as these wages are all well above \$25/hour.
+
+With that aside, the following table presents basic summary statistics for wages before and after the ECE WE. Note that, as expected, the difference in means between the two wages is \$`r 25.96 - 22.02` (i.e. almost \$4).
+
+```{r}
+#| results: true
+
+ece %>%
+  select(wage_we_after, wage_we_before) %>%
+  setNames(c("Hourly Wage After the ECE WE", "Hourly Wage Before the ECE WE")) %>%
+  pivot_longer(cols=1:2) %>%
+  filter(value <= 100) %>%
+  group_by(name) %>%
+  summarise(
+    `mean` = mean(value, na.rm=T),
+    `standard deviation` = sd(value, na.rm=T),
+    maximum = max(value, na.rm=T),
+    minimum = min(value, na.rm=T)
+  ) %>%
+  mutate(across(where(is.numeric), ~scales::dollar(., accuracy=.01))) %>%
+  rename("wage type" = name) %>%
+  knitr::kable()
+```
+
+```{r model 1}
+# Model 1: everyone under $25 gets $25
+
+m1 = ece %>%
+  select(where(is.numeric)) %>%
+  mutate(across(, ~replace_na(., 0))) %>%
+  mutate(
+    old_wage = pmax(wage_we_before, wage_we_after, wage_no_we, wage),
+    new_wage = pmax(old_wage, 25),
+    cost_before = old_wage * hours,
+    cost_after = new_wage * hours,
+    incremental_cost = pmax(0, cost_after - cost_before),
+    got_boost = incremental_cost > 0
+  )
+
+r1 = m1 %>%
+  summarise(
+    `# ECEs that receive wage boost` = scales::comma(sum(got_boost)),
+    `mean wage boost per employee` = scales::dollar(mean(case_when(incremental_cost == 0 ~ NA_real_, T ~ new_wage - old_wage), na.rm=T)),
+    `mean incremental cost per employee` = scales::dollar(mean(case_when(incremental_cost == 0 ~ NA_real_, T ~ incremental_cost), na.rm=T)),
+    `total budget impact` = scales::dollar(sum(incremental_cost))
+  ) %>%
+  pivot_longer(cols=everything(), names_to = "statistic", values_to = "model 1")
+```
+
+```{r model 2}
+# Model 2: only those not getting the enhancement get it (capped at $25)
+
+m2 = ece %>%
+  filter(!received_we) %>%
+  select(where(is.numeric)) %>%
+  mutate(across(, ~replace_na(., 0))) %>%
+  mutate(
+    old_wage = wage_no_we,
+    new_wage = case_when(old_wage < 25 ~ pmin(25, old_wage + 4), T ~ old_wage),
+    cost_before = old_wage * hours,
+    cost_after = new_wage * hours,
+    incremental_cost = pmax(0, cost_after - cost_before),
+    got_boost = incremental_cost > 0
+  )
+
+r2 = m2 %>%
+  summarise(
+    `# ECEs that receive wage boost` = scales::comma(sum(got_boost)),
+    `mean wage boost per employee` = scales::dollar(mean(case_when(incremental_cost == 0 ~ NA_real_, T ~ new_wage - old_wage), na.rm=T)),
+    `mean incremental cost per employee` = scales::dollar(mean(case_when(incremental_cost == 0 ~ NA_real_, T ~ incremental_cost), na.rm=T)),
+    `total budget impact` = scales::dollar(sum(incremental_cost))
+  ) %>%
+  pivot_longer(cols=everything(), names_to = "statistic", values_to = "model 2")
+```
+
+```{r}
+result = inner_join(r1, r2)
+```
+
+The following table gives the budget impact results for the two models. As can be seen, the budget impact associated with bumping all ECEs up to \$25/hour is `r result[[4,2]]` and the budget impact associated with giving the wage enhancement up to a maximum of \$25 is `r result[[4,3]]`.
+
+```{r}
+#| results: true
+
+knitr::kable(result)
+```
+
+This analysis makes a number of assumptions. First, it is assumed that the hours worked per week does not change with a proposed wage enhancement. Second, it assumes the data are organized consistently across columns, with columns accurately capturing data on the same employee based on relative position. Third, as discussed, it assumes that some wage data were entered incorrectly.
